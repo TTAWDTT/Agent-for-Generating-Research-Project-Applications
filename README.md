@@ -1,6 +1,6 @@
 **该agent用于根据用户的输入，将其转化为标准格式的提纲（该功能开发中），然后根据提纲生成提示词，进而生成科研项目申请书**
 *目前的文件为使用训练版，无法接收输入，如果需要修改生成，可以在user_input中修改，在确立config.json的模板后会马上开发交互功能*
-<img width="568" height="651" alt="屏幕截图 2025-08-04 104700" src="https://github.com/user-attachments/assets/080f1e74-56a6-4af2-8a45-7027cc0b8afc" />
+<img width="688" height="845" alt="屏幕截图 2025-08-06 140832" src="https://github.com/user-attachments/assets/70285672-d289-43e2-80c2-fb0c530327b1" />
 ## 部署步骤
 ### 环境要求
 须配置python3.11或借助conda虚拟环境，目前采用Ollama本地部署的qwen3模型（部署过程在此不做说明），下面讲述借助conda的部署步骤
