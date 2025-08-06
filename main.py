@@ -1,4 +1,4 @@
-from typing import TypedDict, Annotated, Sequence, List, Dict, Tuple
+from typing import TypedDict, Annotated, Sequence, List, Dict, Tuple, Optional
 import re
 import numpy as np
 from scipy.special import expit
@@ -7,7 +7,6 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
 import os
 from dotenv import load_dotenv
-# 新增LangSmith追踪相关导入
 from langchain_core.callbacks import CallbackManager
 from langchain_core.tracers.langchain import LangChainTracer
 
@@ -18,156 +17,182 @@ load_dotenv(override=True)
 callback_manager = CallbackManager([LangChainTracer()])
 
 # 初始化大语言模型
-llm = ChatOllama(model="mixtral", temperature=0.5)
+llm = ChatOllama(model="qwen3", temperature=0.5)
 
-# ===== PPO相关工具函数 =====
-class PPOPolicy:
-    """PPO策略类，用于优化生成参数"""
-    def __init__(self, input_size: int = 4, hidden_size: int = 16, lr: float = 0.001):
-        self.weights = np.random.randn(input_size, hidden_size) * 0.1
-        self.bias = np.zeros(hidden_size)
-        self.output_weights = np.random.randn(hidden_size, 1) * 0.1
-        self.output_bias = np.zeros(1)
-        self.optimizer = lr  # 简化的优化器
+# ===== 强化学习策略 (使用REINFORCE算法) =====
+class ReinforcePolicy:
+    """REINFORCE策略类，用于优化优化多个生成参数"""
+    def __init__(self, input_size: int = 3, lr: float = 0.001):
+        # 动作空间：仅保留ChatOllama支持的参数
+        self.action_dims = 2  # 减少为2个参数
+        self.weights = np.random.randn(input_size, self.action_dims) * 0.1
+        self.bias = np.zeros(self.action_dims)
+        self.optimizer = lr  # 学习率
     
-    def forward(self, state_features: np.ndarray) -> float:
-        """根据状态特征预测最佳temperature参数"""
-        hidden = np.tanh(np.dot(state_features, self.weights) + self.bias)
-        output = expit(np.dot(hidden, self.output_weights) + self.output_bias)
-        return 0.1 + output[0] * 0.9  # 将输出映射到0.1-1.0范围的temperature值
+    def forward(self, state_features: np.ndarray) -> Dict[str, float]:
+        """根据状态特征预测最佳生成参数组合"""
+        output = expit(np.dot(state_features, self.weights) + self.bias)
+        
+        # 将输出映射到各参数的有效范围（仅保留temperature和top_p）
+        return {
+            "temperature": 0.1 + output[0] * 0.9,  # 0.1-1.0
+            "top_p": 0.5 + output[1] * 0.5,        # 0.5-1.0
+        }
     
-    def update(self, advantages: np.ndarray, old_log_probs: np.ndarray, 
-               new_log_probs: np.ndarray, states: List[np.ndarray], clip_epsilon: float = 0.2):
-        """PPO更新步骤"""
-        for state, advantage, old_log_prob, new_log_prob in zip(states, advantages, old_log_probs, new_log_probs):
-            ratio = np.exp(new_log_prob - old_log_prob)
-            surr1 = ratio * advantage
-            surr2 = np.clip(ratio, 1 - clip_epsilon, 1 + clip_epsilon) * advantage
-            loss = -np.min([surr1, surr2])  # 负号因为我们要最大化奖励
-            
-            # 简化的梯度下降更新
-            grad = self._compute_gradient(state, loss)
-            self.weights -= self.optimizer * grad[0]
-            self.bias -= self.optimizer * grad[1]
-            self.output_weights -= self.optimizer * grad[2]
-            self.output_bias -= self.optimizer * grad[3]
-    
-    def _compute_gradient(self, state: np.ndarray, loss: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """简化的梯度计算"""
-        return (
-            np.random.randn(*self.weights.shape) * loss * 0.01,
-            np.random.randn(*self.bias.shape) * loss * 0.01,
-            np.random.randn(*self.output_weights.shape) * loss * 0.01,
-            np.random.randn(*self.output_bias.shape) * loss * 0.01
-        )
+    def update(self, state: np.ndarray, action: Dict[str, float], reward: float):
+        """REINFORCE更新步骤"""
+        # 将动作标准化到0-1范围，用于计算策略梯度
+        action_values = np.array([
+            (action["temperature"] - 0.1) / 0.9,  # 仅处理temperature和top_p
+            (action["top_p"] - 0.5) / 0.5,
+        ])
+        
+        # 计算策略梯度 (简化版)
+        log_prob = np.sum(np.log(action_values + 1e-8))  # 防止log(0)
+        grad_weights = np.outer(state, log_prob * reward)
+        grad_bias = log_prob * reward
+        
+        # 梯度上升更新参数 (最大化奖励)
+        self.weights += self.optimizer * grad_weights
+        self.bias += self.optimizer * grad_bias
 
-# 初始化PPO策略
-ppo_policy = PPOPolicy()
+# 初始化REINFORCE策略
+rl_policy = ReinforcePolicy()
 
 # ===== 类型定义 =====
 class ResearchProposalState(TypedDict):
     user_outline: Annotated[str, "用户输入的提纲（含引文）"]
     extracted_citations: Annotated[List[str], "从提纲中提取的引文列表"]
+    used_citations: Annotated[List[str], "已使用的引文列表"]
     requirements: Annotated[str, "申报指南解析结果"]
     sections: Annotated[dict, "申报书各部分内容"]
     draft: Annotated[str, "完整申报书草稿"]
     feedback: Annotated[Sequence[str], "审核反馈记录"]
     final_output: Annotated[str, "最终申报书"]
     scores: Annotated[Dict[str, float], "评分指标"]
-    reward: Annotated[float, "PPO奖励值"]
-    temperature: Annotated[float, "当前生成温度参数"]
+    prev_scores: Annotated[Dict[str, float], "上一轮评分指标"]
+    reward: Annotated[float, "强化学习奖励值"]
+    generation_params: Annotated[Dict[str, float], "当前生成参数"]
     episode: Annotated[int, "训练轮次"]
     total_steps: Annotated[int, "全局迭代步数（防无限循环）"]
+    terminate: Annotated[bool, "是否提前终止"]
+    review_focus: Annotated[str, "审核重点"]
 
 # ===== 评分机制 =====
 def score_proposal(state: ResearchProposalState) -> Dict[str, float]:
     """评估申报书质量的评分函数"""
     scores = {
-        "citation_completeness": 0.0,
-        "citation_relevance": 0.0,
         "structure_quality": 0.0,
-        "content_relevance": 0.0
+        "content_relevance": 0.0,
+        "language_quality": 0.0
     }
     
-    # 1. 引文完整性评分（0-10分）
-    total_citations = len(state["extracted_citations"])
-    if total_citations > 0:
-        missing = [c for c in state["extracted_citations"] if c not in state["draft"]]
-        scores["citation_completeness"] = 10.0 * (1 - len(missing)/total_citations)
-    
-    # 2. 引文相关性评分
-    if state["feedback"]:
-        last_feedback = state["feedback"][-1]
-        if "引文合理" in last_feedback:
-            scores["citation_relevance"] = 8.0 + (2.0 if "高度相关" in last_feedback else 0)
-        elif "引文不相关" in last_feedback:
-            scores["citation_relevance"] = 3.0
-        else:
-            scores["citation_relevance"] = 5.0
-    
-    # 3. 结构完整性评分
+    # 1. 结构完整性评分
     required_sections = ["项目名称", "研究背景", "研究内容", "研究目标", 
                         "技术路线", "创新点", "预期成果", "研究基础"]
     completed_sections = sum(1 for sec in required_sections if sec in state["sections"])
     scores["structure_quality"] = 10.0 * (completed_sections / len(required_sections))
     
-    # 4. 内容相关性评分
+    # 2. 内容相关性评分
     if state["user_outline"] and state["draft"]:
         outline_keywords = re.findall(r"[\u4e00-\u9fffA-Za-z0-9]+", state["user_outline"])
         draft_keywords = re.findall(r"[\u4e00-\u9fffA-Za-z0-9]+", state["draft"])
         overlap = len(set(outline_keywords) & set(draft_keywords)) / len(set(outline_keywords)) if outline_keywords else 0
         scores["content_relevance"] = 10.0 * overlap
     
+    # 3. 语言质量评分
+    if state["draft"]:
+        sentences = re.split(r'[。！？,.!?]', state["draft"])
+        valid_sentences = [s for s in sentences if s.strip()]
+        avg_sentence_length = np.mean([len(s) for s in valid_sentences]) if valid_sentences else 0
+        if 15 <= avg_sentence_length <= 30:
+            scores["language_quality"] = 8.0
+        elif 10 <= avg_sentence_length < 15 or 30 < avg_sentence_length <= 40:
+            scores["language_quality"] = 6.0
+        else:
+            scores["language_quality"] = 3.0
+    
     return scores
 
-def calculate_reward(scores: Dict[str, float]) -> float:
-    """基于评分计算PPO奖励"""
+def calculate_reward(scores: Dict[str, float], prev_scores: Dict[str, float]) -> float:
+    """基于评分计算强化学习奖励，包含增量奖励"""
     weights = {
-        "citation_completeness": 0.3,
-        "citation_relevance": 0.3,
-        "structure_quality": 0.2,
-        "content_relevance": 0.2
+        "structure_quality": 0.4,
+        "content_relevance": 0.4,
+        "language_quality": 0.2
     }
-    return sum(scores[key] * weights[key] for key in scores)
+    
+    # 基础奖励
+    base_reward = sum(scores[key] * weights[key] for key in scores)
+    
+    # 增量奖励（仅奖励正向提升）
+    if prev_scores and all(key in prev_scores for key in scores):
+        delta = sum(max(0, scores[key] - prev_scores[key]) * weights[key] for key in scores)
+        return base_reward + delta
+    
+    return base_reward
 
-# ===== 辅助函数：从提纲提取引文 =====
+# ===== 辅助函数 =====
 def extract_citations(outline: str) -> List[str]:
-    # 1. 先定位到"引文如下："之后的内容，避免前面文本干扰
+    """从提纲中提取引文"""
     citations_start = outline.find("引文如下：")
     if citations_start == -1:
         print("未找到'引文如下：'标记，无法提取引文")
         return []
     citations_text = outline[citations_start + len("引文如下："):]
     
-    # 2. 优化正则：匹配每行开头的序号+标题+作者+要点
-    # 增加re.MULTILINE使^匹配每行开头，使用非贪婪匹配处理标题
-    pattern = r'^\d+\.\s+(.+?)\n作者：(.+?)\n要点：(.+?)(?=\n\d+\.|$)'
-    citations = re.findall(
-        pattern, 
-        citations_text, 
-        re.DOTALL | re.MULTILINE  # 关键：添加多行模式
-    )
+    # 优化正则：兼容数字+点/括号格式
+    citation_blocks = re.split(r"\n\s*(\d+\.|\(\d+\))\s*", citations_text.strip())
     
-    # 增强调试信息
-    print(f"提取到{len(citations)}条引文")
-    for i, cit in enumerate(citations, 1):
-        print(f"引文{i}：标题={cit[0][:30]}..., 作者={cit[1][:20]}...")
+    citations = []
+    for i in range(1, len(citation_blocks), 2):
+        if i + 1 >= len(citation_blocks):
+            continue
+            
+        num = citation_blocks[i].strip()
+        content = citation_blocks[i+1].strip()
+        
+        if "作者：" in content and "要点：" in content:
+            citations.append(f"{num} {content}")
     
-    # 清理并去重（合并为字符串便于后续检查）
-    cleaned = [f"{num}. {title}\n作者：{author}\n要点：{points}" 
-              for num, (title, author, points) in enumerate(citations, 1)]
-    return list(set(cleaned))  # 去重
+    # 去重并保留顺序
+    seen = set()
+    unique_citations = []
+    for cit in citations:
+        if cit not in seen:
+            seen.add(cit)
+            unique_citations.append(cit)
+    
+    print(f"提取到{len(unique_citations)}条引文")
+    for i, cit in enumerate(unique_citations, 1):
+        truncated = cit[:60] + "..." if len(cit) > 60 else cit
+        print(f"引文{i}：{truncated}")
+    
+    return unique_citations
+
+def check_used_citations(draft: str, all_citations: List[str]) -> List[str]:
+    """检查哪些引文已在草稿中使用（更健壮的匹配）"""
+    used = []
+    for citation in all_citations:
+        # 提取引文唯一标识（序号+作者）
+        id_match = re.match(r"^(\d+\.|\(\d+\))\s*作者：([^，,]+)", citation)
+        if id_match:
+            citation_id = id_match.group(1) + id_match.group(2)
+        else:
+            citation_id = citation.split('\n')[0]  #  fallback
+        
+        if citation_id in draft:
+            used.append(citation)
+    return used
 
 # ===== Agent定义 =====
 def requirements_analyzer(state: ResearchProposalState):
     print(f"\n[步骤{state['total_steps']}] 开始分析需求...")
-    # 提取提纲中的引文并存储
     citations = extract_citations(state["user_outline"])
-    print(f"[需求分析] 提取到引文：{citations}")
+    print(f"[需求分析] 提取到{len(citations)}条引文")
     
-    # 分析申报要求
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "您是科研项目申报专家，分析项目类型和要求，注意提纲中已有引文：{citations}"),
+        ("system", "您是科研项目申报专家，分析项目类型和要求，可参考提纲中提供的引文：{citations}"),
         ("human", "用户提纲：{user_outline}\n请总结该类项目的核心要求（格式、内容、常见错误）")
     ])
     chain = prompt | llm
@@ -178,6 +203,7 @@ def requirements_analyzer(state: ResearchProposalState):
     return {
         "requirements": result.content,
         "extracted_citations": citations,
+        "used_citations": [],
         "total_steps": state["total_steps"] + 1
     }
 
@@ -188,43 +214,80 @@ def content_generator(state: ResearchProposalState):
         "技术路线", "创新点", "预期成果", "研究基础"
     ]
     
-    # 从PPO策略获取当前temperature参数
-    state_features = np.array([
-        len(state["extracted_citations"]),
-        len(state["sections"]),
-        len(state["feedback"]),
-        state["temperature"] if "temperature" in state else 0.5
-    ])
-    current_temp = ppo_policy.forward(state_features)
-    print(f"[内容生成] PPO调整温度参数为: {current_temp:.2f}")
+    # 优先生成未完成或评分低的章节
+    if state["scores"]:
+        section_quality = {}
+        for section in sections_to_generate:
+            if section in state["sections"]:
+                section_quality[section] = state["scores"].get("structure_quality", 0)
+            else:
+                section_quality[section] = -1  # 未生成章节优先级最高
+        
+        sections_to_generate = sorted(sections_to_generate, key=lambda x: section_quality[x])
     
+    # 强化学习状态特征（移除引文相关特征）
+    state_features = np.array([
+        len(state["feedback"]),
+        state["scores"].get("content_relevance", 0) / 10,
+        min(state["total_steps"] / 30, 1.0),  # 归一化到0-1
+    ])
+    
+    current_params = rl_policy.forward(state_features)
+    print(f"[内容生成] 强化学习调整参数为: {current_params}")
+    
+    # 审核重点提示
+    focus_prompt = ""
+    if state["review_focus"] == "structure":
+        focus_prompt = "特别注意章节结构的完整性和逻辑性。"
+    elif state["review_focus"] == "content":
+        focus_prompt = "特别注意内容与用户提纲的相关性和深度。"
+    elif state["review_focus"] == "language":
+        focus_prompt = "特别注意语言表达的准确性、流畅性和专业性。"
+    
+    # 章节长度配置
+    section_lengths = {
+        "研究背景": 800, "研究内容": 1200, "技术路线": 1000,
+        "创新点": 600, "预期成果": 600, "研究基础": 800,
+        "项目名称": 100, "研究目标": 500
+    }
+    
+    # 生成或更新章节
+    new_sections = state["sections"].copy()  # 保留已有内容
     for section in sections_to_generate:
-        if section not in state["sections"]:
-            # 使用PPO调整后的temperature
-            llm.temperature = current_temp
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", f"""您是科研申报专家，撰写'{section}'部分。必须严格使用提纲中的所有引文：{state['extracted_citations']}，
-                不得遗漏，引用时保留原格式（如Smith et al.(2023)），并解释引文与内容的关联。"""),
-                ("human", "根据提纲生成内容，确保每个引文都被用到：\n{user_outline}")
-            ])
-            chain = prompt | llm
-            result = chain.invoke({
-                "section": section,
-                "requirements": state["requirements"],
-                "user_outline": state["user_outline"]
-            })
-            state["sections"][section] = result.content
-            print(f"[内容生成] 完成'{section}'部分")
+        # 保留高质量章节
+        if section in new_sections and state["scores"].get("structure_quality", 0) > 7:
+            print(f"[内容生成] '{section}' 质量较高，跳过重新生成")
+            continue
+            
+        # 应用生成参数
+        llm.temperature = current_params["temperature"]
+        llm.top_p = current_params["top_p"]
+        
+        max_tokens = section_lengths.get(section, 800)
+        # 调整提示词，使引文作为辅助参考
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", f"""您是科研申报专家，撰写'{section}'部分。{focus_prompt}
+            可参考提纲中的引文作为辅助：{state['extracted_citations']}，
+            引用时保留原格式，解释引文与内容的关联（如适用）。控制在{max_tokens}字左右。"""),
+            ("human", "根据提纲生成内容：\n{user_outline}")
+        ])
+        chain = prompt | llm
+        result = chain.invoke({
+            "section": section,
+            "requirements": state["requirements"],
+            "user_outline": state["user_outline"]
+        })
+        new_sections[section] = result.content
+        print(f"[内容生成] 完成'{section}'部分")
     
     return {
-        "sections": state["sections"],
-        "temperature": current_temp,
+        "sections": new_sections,
+        "generation_params": current_params,
         "total_steps": state["total_steps"] + 1
     }
 
 def proposal_integrator(state: ResearchProposalState):
     print(f"\n[步骤{state['total_steps']}] 开始整合提案...")
-    # 标准化申报书结构
     draft = "# 科研项目申报书\n\n"
     
     # 1. 项目基本信息表
@@ -247,10 +310,15 @@ def proposal_integrator(state: ResearchProposalState):
     
     draft += "### （二）国内外研究现状\n"
     draft += "1. 相关领域研究进展：\n"
-    for citation in state["extracted_citations"]:
-        draft += f"- {citation}的研究表明..."
+    # 调整引文使用方式，作为参考信息
+    if state["extracted_citations"]:
+        draft += "参考相关研究成果：\n"
+        for citation in state["extracted_citations"]:
+            draft += f"- {citation}的研究表明..."
+    else:
+        draft += "（请补充相关领域研究进展）\n"
     draft += "\n\n2. 现有研究不足：\n"
-    draft += "（结合上述文献分析当前研究空白）\n\n"
+    draft += "（结合相关研究分析当前研究空白）\n\n"
     
     # 3. 研究内容与目标
     draft += "## 三、研究内容与目标\n"
@@ -276,13 +344,51 @@ def proposal_integrator(state: ResearchProposalState):
     if "创新点" in state["sections"]:
         draft += state["sections"]["创新点"] + "\n\n"
     
-    # 6. 研究计划与进度安排
+     # 6. 研究计划与进度安排（动态版本）
     draft += "## 六、研究计划与进度\n"
-    draft += "| 时间阶段 | 主要工作内容 |\n"
-    draft += "|----------|--------------|\n"
-    draft += "| 第1-3月 | 文献调研与方案设计 |\n"
-    draft += "| 第4-9月 | 实验系统开发与数据采集 |\n"
-    draft += "| 第10-12月 | 结果分析与报告撰写 |\n\n"
+    draft += "| 时间阶段 | 主要工作内容 | 阶段目标 |\n"
+    draft += "|----------|--------------|----------|\n"
+    
+    # 从用户提纲提取研究周期（默认2年）
+    period_match = re.search(r"研究周期：(\d+)年", state["user_outline"])
+    total_years = int(period_match.group(1)) if period_match else 2
+    total_months = total_years * 12  # 总月数
+    
+    # 按研究阶段比例分配时间（可根据总周期自适应）
+    stages = [
+        {
+            "ratio": 0.2,  # 占总周期的20%
+            "title": "文献调研与方案设计",
+            "goal": "完成文献综述、确定技术路线"
+        },
+        {
+            "ratio": 0.5,  # 50%
+            "title": "核心技术研发与实验验证",
+            "goal": "实现关键技术突破、完成原型系统开发"
+        },
+        {
+            "ratio": 0.3,  # 30%
+            "title": "系统优化与成果整理",
+            "goal": "完成系统测试、撰写研究报告与论文"
+        }
+    ]
+    
+    # 计算各阶段时间范围
+    current_month = 1
+    for i, stage in enumerate(stages, 1):
+        stage_months = int(round(total_months * stage["ratio"], 0))
+        end_month = current_month + stage_months - 1
+        
+        # 格式化时间显示（如"第1-3月"、"第4-10月"）
+        if current_month == end_month:
+            time_range = f"第{current_month}月"
+        else:
+            time_range = f"第{current_month}-{end_month}月"
+        
+        draft += f"| {time_range} | {stage['title']} | {stage['goal']} |\n"
+        current_month = end_month + 1  # 进入下一阶段
+    
+    draft += "\n"  # 换行分隔
     
     # 7. 预期成果
     draft += "## 七、预期成果与形式\n"
@@ -297,46 +403,96 @@ def proposal_integrator(state: ResearchProposalState):
     draft += "### （一）前期研究积累\n"
     draft += "### （二）实验条件保障\n\n"
     
-    # 9. 经费预算
+    # 9. 经费预算（动态计算版本）
     draft += "## 九、经费预算（单位：元）\n"
     draft += "| 预算科目 | 金额 | 计算依据 |\n"
     draft += "|----------|------|----------|\n"
-    draft += "| 文献资料费 | 5000 | 数据库订阅与文献购买 |\n"
-    draft += "| 实验材料费 | 20000 | 实验耗材与样本采集 |\n"
-    draft += "| 差旅费 | 8000 | 学术交流与数据采集 |\n"
-    draft += "| 合计 | 33000 | |\n\n"
     
-    # 引文完整性检查补充
-    missing = [c for c in state["extracted_citations"] if c not in draft]
-    if missing:
-        draft += "## 十、引文补充说明\n"
-        draft += f"未在正文中规范引用的文献：{', '.join(missing)}\n"
-        draft += "补充引用说明：\n"
-        for c in missing:
-            draft += f"- {c}：[请补充引用场景说明]\n"
+    # 从用户提纲提取拟资助经费（如果存在）
+    fund_match = re.search(r"拟资助经费：(\d+)万", state["user_outline"])
+    total_fund = int(fund_match.group(1)) * 10000 if fund_match else 300000  # 默认30万
     
-    print(f"[提案整合] 完成草稿生成，共{len(draft)}字符")
+    # 按比例分配预算
+    budget_items = {
+        "文献资料费": 0.05,    # 5%
+        "实验材料费": 0.4,     # 40%
+        "差旅费": 0.15,        # 15%
+        "设备使用费": 0.2,     # 20%
+        "劳务费": 0.15,        # 15%
+        "其他费用": 0.05       # 5%
+    }
+    
+    for item, ratio in budget_items.items():
+        amount = int(total_fund * ratio)
+        # 根据科目设置计算依据
+        basis = {
+            "文献资料费": "数据库订阅与文献购买",
+            "实验材料费": "实验耗材与样本采集",
+            "差旅费": "学术交流与数据采集",
+            "设备使用费": "仪器租赁与维护",
+            "劳务费": "参与人员补助",
+            "其他费用": "不可预见支出"
+        }[item]
+        draft += f"| {item} | {amount} | {basis} |\n"
+    
+    draft += f"| 合计 | {total_fund} | |\n\n"
+    
+    # 检查已使用引文（作为辅助信息）
+    used_citations = check_used_citations(draft, state["extracted_citations"])
+    missing = [c for c in state["extracted_citations"] if c not in used_citations]
+    
+    if missing and len(missing) < len(state["extracted_citations"])/2:
+        draft += "## 十、参考资料说明\n"
+        draft += f"部分参考资料未在正文中直接引用：{', '.join([c.split(chr(10))[0] for c in missing])}\n"
+    
+    print(f"[提案整合] 完成草稿生成，共{len(draft)}字符，参考了{len(used_citations)}/{len(state['extracted_citations'])}条引文")
     return {
         "draft": draft,
+        "used_citations": used_citations,
         "total_steps": state["total_steps"] + 1
     }
 
 def quality_reviewer(state: ResearchProposalState):
     print(f"\n[步骤{state['total_steps']}] 开始质量审核...")
+    
+    # 动态调整审核重点
+    if state["scores"]:
+        lowest_score_dim = min(state["scores"], key=state["scores"].get)
+        if lowest_score_dim == "structure_quality":
+            state["review_focus"] = "structure"
+        elif lowest_score_dim == "content_relevance":
+            state["review_focus"] = "content"
+        elif lowest_score_dim == "language_quality":
+            state["review_focus"] = "language"
+        else:
+            state["review_focus"] = "all"
+    else:
+        state["review_focus"] = "all"
+    
+    print(f"[质量审核] 本次审核重点：{state['review_focus']}")
+    
+    # 审核提示词
+    focus_instructions = ""
+    if state["review_focus"] == "structure":
+        focus_instructions = "重点检查申报书的章节结构是否完整，逻辑是否连贯，各部分内容是否符合学术规范。"
+    elif state["review_focus"] == "content":
+        focus_instructions = "重点检查申报书内容与用户提纲的相关性，以及内容的深度和科学性。"
+    elif state["review_focus"] == "language":
+        focus_instructions = "重点检查申报书的语言表达质量，包括准确性、流畅性、专业性和可读性。"
+    
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "审核申报书，重点检查提纲中的引文：{citations}是否全部被正确引用，格式是否保留。"),
-        ("human", "申报书草稿：{draft}\n反馈需包含：1. 引文完整性 2. 引用合理性 3. 其他改进建议")
+        ("system", f"您是科研项目评审专家，{focus_instructions}请基于以下要求进行审核并给出具体修改建议。"),
+        ("human", "申报书草稿：{draft}\n需求要求：{requirements}\n请给出详细审核意见：")
     ])
     chain = prompt | llm
     result = chain.invoke({
-        "requirements": state["requirements"],
         "draft": state["draft"],
-        "citations": state["extracted_citations"]
+        "requirements": state["requirements"]
     })
     
     # 计算评分和奖励
     new_scores = score_proposal(state)
-    new_reward = calculate_reward(new_scores)
+    new_reward = calculate_reward(new_scores, state["scores"])
     
     feedback = state["feedback"] + [result.content]
     print(f"[质量审核] 完成审核，评分：{new_scores}，奖励：{new_reward:.2f}")
@@ -344,73 +500,79 @@ def quality_reviewer(state: ResearchProposalState):
     return {
         "feedback": feedback,
         "scores": new_scores,
+        "prev_scores": state["scores"],
         "reward": new_reward,
         "total_steps": state["total_steps"] + 1
     }
 
-def ppo_learner(state: ResearchProposalState):
-    print(f"\n[步骤{state['total_steps']}] 开始PPO学习...")
-    """PPO学习节点，根据奖励更新策略"""
+def rl_learner(state: ResearchProposalState):
+    print(f"\n[步骤{state['total_steps']}] 开始强化学习更新...")
+    """强化学习学习节点，根据奖励更新策略"""
     if state["episode"] > 0:  # 至少完成一个回合才更新
-        # 准备训练数据
         state_features = np.array([
-            len(state["extracted_citations"]),
-            len(state["sections"]),
             len(state["feedback"]),
-            state["temperature"]
+            state["scores"].get("content_relevance", 0) / 10,
+            min(state["total_steps"] / 30, 1.0),
         ])
         
-        # 计算优势函数
-        advantage = state["reward"] - 5.0  # 假设平均奖励为5.0
-        
-        # 旧策略概率
-        old_log_prob = np.log(state["temperature"] / 1.0)
-        
-        # 新策略概率
-        new_temp = ppo_policy.forward(state_features)
-        new_log_prob = np.log(new_temp / 1.0)
-        
-        # 更新PPO策略
-        ppo_policy.update(
-            advantages=np.array([advantage]),
-            old_log_probs=np.array([old_log_prob]),
-            new_log_probs=np.array([new_log_prob]),
-            states=[state_features]
+        # 更新REINFORCE策略
+        rl_policy.update(
+            state=state_features,
+            action=state["generation_params"],
+            reward=state["reward"]
         )
-        print(f"[PPO学习] 策略更新完成，优势值：{advantage:.2f}")
+        print(f"[强化学习] 策略更新完成，奖励值：{state['reward']:.2f}")
     
-    # 准备下一轮
+    # 检查是否达到质量标准
+    if state["scores"]:
+        avg_score = sum(state["scores"].values()) / len(state["scores"])
+        if avg_score > 8.0:
+            print(f"[强化学习] 质量达标（平均分{avg_score:.2f}），提前终止训练")
+            return {
+                "episode": state["episode"] + 1,
+                "feedback": [],
+                "terminate": True,
+                "total_steps": state["total_steps"] + 1
+            }
+    
+    # 准备下一轮（保留高质量章节）
     next_episode = state["episode"] + 1
-    print(f"[PPO学习] 完成第{state['episode']}轮，进入第{next_episode}轮")
+    print(f"[强化学习] 完成第{state['episode']}轮，进入第{next_episode}轮")
     return {
         "episode": next_episode,
-        "sections": {},  # 重置部分状态用于下一轮训练
         "feedback": [],
+        "terminate": False,
         "total_steps": state["total_steps"] + 1
     }
 
 def revision_director(state: ResearchProposalState):
     """审核结果导向器，决定下一步流程"""
+    if state.get("terminate", False):
+        return "END"
+    
     last_feedback = state["feedback"][-1] if state["feedback"] else ""
     
-    # 放宽条件：即使有建议修改，超过2轮也强制进入学习阶段
+    # 限制修改次数
     if len(state["feedback"]) >= 2 and "建议修改" in last_feedback:
         print("[审核导向] 修改次数达2次，强制进入学习阶段")
-        return "ppo_learn"  # 直接返回目标节点名称
+        return "rl_learn"
     
-    if "关键缺陷" in last_feedback or "引文遗漏" in last_feedback:
-        print("[审核导向] 发现关键缺陷，返回需求分析")
-        return "analyze_requirements"
-    elif "建议修改" in last_feedback:
-        print("[审核导向] 需要 minor 修改，返回内容生成")
+    if "结构不完整" in last_feedback:
+        print("[审核导向] 发现结构问题，返回内容生成")
+        return "generate_content"
+    elif "内容不相关" in last_feedback:
+        print("[审核导向] 内容相关性不足，返回内容生成")
+        return "generate_content"
+    elif "语言问题" in last_feedback:
+        print("[审核导向] 语言表达需改进，返回内容生成")
         return "generate_content"
     
-    print("[审核导向] 审核通过，进入PPO学习")
-    return "ppo_learn"  # 直接返回目标节点名称
+    print("[审核导向] 审核通过，进入强化学习")
+    return "rl_learn"
 
 def check_termination(state: ResearchProposalState):
     """检查是否需要强制终止流程"""
-    max_steps = 30  # 最大步骤限制
+    max_steps = 30
     if state["total_steps"] >= max_steps:
         print(f"\n[终止检查] 已达到最大步骤({max_steps})，强制终止流程")
         return "force_end"
@@ -423,41 +585,42 @@ workflow = StateGraph(ResearchProposalState)
 workflow.add_node("analyze_requirements", requirements_analyzer)
 workflow.add_node("generate_content", content_generator)
 workflow.add_node("integrate_proposal", proposal_integrator)
+workflow.add_node("check_termination", lambda s: {"total_steps": s["total_steps"] + 1})  # 步骤计数
 workflow.add_node("review_quality", quality_reviewer)
-workflow.add_node("ppo_learn", ppo_learner)
-workflow.add_node("check_termination", lambda s: {"total_steps": s["total_steps"] + 1})  # 步骤计数节点
+workflow.add_node("rl_learn", rl_learner)
 
 # 设置入口
 workflow.set_entry_point("analyze_requirements")
 
-# 添加主流程边
+# 主流程：加入终止检查节点
 workflow.add_edge("analyze_requirements", "generate_content")
 workflow.add_edge("generate_content", "integrate_proposal")
-workflow.add_edge("integrate_proposal", "review_quality")
+workflow.add_edge("integrate_proposal", "check_termination")  # 先检查是否终止
 
-# 审核后条件分支 - 修复关键错误点
-workflow.add_conditional_edges(
-    "review_quality",
-    revision_director,  # 该函数直接返回目标节点名称
-    {
-        "analyze_requirements": "analyze_requirements",
-        "generate_content": "generate_content",
-        "ppo_learn": "ppo_learn"
-    }
-)
-
-# PPO学习后循环或结束
-workflow.add_conditional_edges(
-    "ppo_learn",
-    lambda state: "continue" if state["episode"] < 3 else "END",  # 3轮训练
-    {"continue": "analyze_requirements", "END": END}
-)
-
-# 添加全局步骤检查（防止无限循环）
+# 终止检查后分支
 workflow.add_conditional_edges(
     "check_termination",
     check_termination,
-    {"force_end": END, "continue": "integrate_proposal"}
+    {"force_end": END, "continue": "review_quality"}
+)
+
+# 审核后条件分支
+workflow.add_conditional_edges(
+    "review_quality",
+    revision_director,
+    {
+        "analyze_requirements": "analyze_requirements",
+        "generate_content": "generate_content",
+        "rl_learn": "rl_learn",
+        "END": END
+    }
+)
+
+# 强化学习后循环或结束
+workflow.add_conditional_edges(
+    "rl_learn",
+    lambda state: "END" if state["terminate"] or state["episode"] >= 3 else "analyze_requirements",
+    {"END": END, "analyze_requirements": "analyze_requirements"}
 )
 
 # 执行引擎
@@ -465,7 +628,6 @@ research_app = workflow.compile()
 
 # ===== 执行示例 =====
 if __name__ == "__main__":
-    # 用户输入（含明确引文）
     user_outline = """
 面向电磁域多模态信息的任务理解及思维推理技术
 研究目标:围绕无人化智能化快速发展、AIAgent将用于大幅削减人工成本的趋势，开展面向电磁域多模态信息的任务理解及思维推理技术研究，突破面向多模态信息的多层次决策融合、多AIAgent自演进动态拓扑流等关键技术，面向典型电磁应用任务构建仿真系统并完成验证。
@@ -525,20 +687,27 @@ if __name__ == "__main__":
     initial_state = {
         "user_outline": user_outline,
         "extracted_citations": [],
+        "used_citations": [],
         "requirements": "",
         "sections": {},
         "draft": "",
         "feedback": [],
         "final_output": "",
         "scores": {},
+        "prev_scores": {},
         "reward": 0.0,
-        "temperature": 0.5,
+        "generation_params": {
+            "temperature": 0.5,
+            "top_p": 0.7,
+        },
         "episode": 0,
-        "total_steps": 0  # 初始化步骤计数
+        "total_steps": 0,
+        "terminate": False,
+        "review_focus": "all"
     }
     
-    # 执行PPO训练循环（传入追踪回调）
-    print("开始PPO训练循环...")
+    # 执行流程
+    print("开始强化学习训练循环...")
     final_state = research_app.invoke(initial_state, config={"callbacks": callback_manager})
     
     print(f"\n训练完成（{final_state['episode']}轮，{final_state['total_steps']}步）")
