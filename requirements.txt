@@ -1,6 +1,21 @@
-langgraph>=0.1.0
-langchain-core>=0.1.0
-langchain-ollama>=0.1.0
-numpy>=1.26.0
-scipy>=1.11.0
-python-dotenv>=1.0.0
+# requirements.txt - Specific versions for main3.py
+python-dotenv==1.0.0
+pyyaml==6.0.1
+typing-extensions==4.8.0
+
+# LangChain ecosystem
+langchain==0.1.16
+langchain-core==0.1.45
+langchain-community==0.0.33
+langchain-ollama==0.1.0
+
+# LangGraph for state management
+langgraph==0.0.55
+
+# System monitoring
+psutil==5.9.5
+
+# Optional but recommended
+numpy==1.25.2
+ujson==5.8.0
+colorlog==6.8.0
